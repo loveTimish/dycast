@@ -69,13 +69,14 @@ import {
   type LiveRoom
 } from '@/core/dycast';
 import { verifyRoomNum, verifyWsUrl } from '@/utils/verifyUtil';
-import { ref, useTemplateRef, onMounted } from 'vue';
+import { ref, useTemplateRef, onMounted, onUnmounted } from 'vue';
 import { CLog } from '@/utils/logUtil';
 import { getId } from '@/utils/idUtil';
 import { RelayCast } from '@/core/relay';
 import SkMessage from '@/components/Message';
 import { formatDate } from '@/utils/commonUtil';
 import FileSaver from '@/utils/fileUtil';
+import { getLiveInfo } from '@/core/request';
 
 // 连接状态
 const connectStatus = ref<ConnectStatus>(0);
@@ -106,11 +107,16 @@ onMounted(() => {
   // 有房间号就自动连直播间
   if (roomId) {
     connectLive();
+    startGuard();
   }
   // 有转发地址就自动连转发 WS
   if (backendWs) {
     relayCast();
   }
+});
+
+onUnmounted(() => {
+  stopGuard();
 });
 
 /** 直播间信息 */
@@ -135,6 +141,15 @@ const castSet = new Set<string>();
 let castWs: DyCast | undefined;
 // 转发客户端
 let relayWs: RelayCast | undefined;
+// 当前直播信息
+const liveInfoRef = ref<DyLiveInfo | undefined>();
+// 后端场次状态
+const sessionActive = ref(false);
+const sessionId = ref<string | undefined>();
+// 守候轮询
+const GUARD_INTERVAL = 30000;
+let guardTimer: number | undefined;
+let manualDisconnect = false;
 
 /**
  * 验证房间号
@@ -249,6 +264,7 @@ const handleMessages = function (msgs: DyMessage[]) {
             // 已经下播
             newCasts.push(msg);
             otherCasts.push(msg);
+            stopSessionIfNeeded();
             disconnectLive();
           }
           break;
@@ -280,6 +296,91 @@ const addConsoleMessage = function (content: string) {
     ]);
 };
 
+/** 通知后端开播 */
+const startSessionIfNeeded = async (info?: DyLiveInfo) => {
+  if (sessionActive.value || !info) return;
+  try {
+    const res = await fetch('http://127.0.0.1:8000/live_sessions/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        room_id: info.roomId,
+        unique_id: info.uniqueId,
+        anchor_name: info.nickname,
+        title: info.title
+      })
+    });
+    const data = await res.json();
+    sessionActive.value = true;
+    sessionId.value = data.session_id;
+    addConsoleMessage(`后端已创建场次：${data.session_id || ''}`);
+  } catch (err) {
+    CLog.warn('通知后端开播失败', err);
+    SkMessage.warning('通知后端开播失败，请检查后端服务');
+  }
+};
+
+/** 通知后端下播 */
+const stopSessionIfNeeded = async () => {
+  if (!sessionActive.value) return;
+  sessionActive.value = false;
+  const sid = sessionId.value;
+  sessionId.value = undefined;
+  try {
+    await fetch('http://127.0.0.1:8000/live_sessions/stop', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        room_id: liveInfoRef.value?.roomId,
+        unique_id: liveInfoRef.value?.uniqueId
+      })
+    });
+    addConsoleMessage(`后端已结束场次${sid ? `：${sid}` : ''}`);
+  } catch (err) {
+    CLog.warn('通知后端下播失败', err);
+  }
+};
+
+/** 守候轮询 */
+const pollLiveStatus = async () => {
+  if (!roomNum.value) return;
+  try {
+    const info = await getLiveInfo(roomNum.value);
+    if (!info) return;
+    liveInfoRef.value = info;
+    setRoomInfo(info);
+    if (info.status === RoomStatus.LIVING) {
+      await startSessionIfNeeded(info);
+      // 若未连接则尝试连接
+      if (!castWs) {
+        connectLive();
+      }
+    } else {
+      // 已下播
+      if (sessionActive.value) {
+        await stopSessionIfNeeded();
+      }
+      if (castWs) disconnectLive();
+    }
+  } catch (err) {
+    CLog.warn('轮询直播状态失败', err);
+  }
+};
+
+const startGuard = () => {
+  if (guardTimer) return;
+  guardTimer = window.setInterval(pollLiveStatus, GUARD_INTERVAL);
+  // 立即执行一次，避免等待周期
+  pollLiveStatus();
+};
+
+const stopGuard = () => {
+  if (guardTimer) {
+    clearInterval(guardTimer);
+    guardTimer = undefined;
+  }
+};
+
 /**
  * 清理列表
  */
@@ -295,10 +396,15 @@ function clearMessageList() {
  */
 const connectLive = function () {
   try {
+    if (castWs) {
+      CLog.info('已有连接实例，跳过重复连接');
+      return;
+    }
     // 清空上一次连接的消息
     clearMessageList();
     CLog.debug('正在连接:', roomNum.value);
     SkMessage.info(`正在连接：${roomNum.value}`);
+    startGuard();
     const cast = new DyCast(roomNum.value);
     cast.on('open', (ev, info) => {
       CLog.info('DyCast 房间连接成功');
@@ -306,6 +412,8 @@ const connectLive = function () {
       setRoomInputStatus(true);
       connectStatus.value = 1;
       setRoomInfo(info);
+      liveInfoRef.value = info;
+      startSessionIfNeeded(info);
       addConsoleMessage('直播间已连接');
     });
     cast.on('error', err => {
@@ -318,6 +426,10 @@ const connectLive = function () {
       CLog.info(`DyCast 房间已关闭[${code}] => ${reason}`);
       connectStatus.value = 3;
       setRoomInputStatus(false);
+      // 仅在主播真实下播或手动断开时结束场次；网络抖动的重连不结束
+      if (code === DyCastCloseCode.LIVE_END || manualDisconnect) {
+        stopSessionIfNeeded();
+      }
       switch (code) {
         case DyCastCloseCode.NORMAL:
           SkMessage.success('断开成功');
@@ -337,6 +449,8 @@ const connectLive = function () {
         if (statusPanelRef.value) addConsoleMessage(`连接已关闭，共持续: ${statusPanelRef.value.getDuration()}`);
         else addConsoleMessage('连接已关闭');
       }
+      castWs = undefined;
+      manualDisconnect = false;
     });
     cast.on('message', msgs => {
       handleMessages(msgs);
@@ -367,7 +481,11 @@ const connectLive = function () {
 };
 /** 断开连接 */
 const disconnectLive = function () {
-  if (castWs) castWs.close(1000, '断开连接');
+  manualDisconnect = true;
+  if (castWs) {
+    castWs.close(1000, '断开连接');
+    castWs = undefined;
+  }
 };
 
 /** 连接转发房间 */
